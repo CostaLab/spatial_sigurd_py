@@ -1,0 +1,44 @@
+{
+  "template": "https://github.com/scverse/cookiecutter-scverse",
+  "commit": "bc020b0f1e2afa227ed6fee242120ab80daaf32c",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "project_name": "spatial_sigurd_py",
+      "package_name": "spatial_sigurd_py",
+      "project_description": "Python implementation of SIGURD with spatial clone detection.",
+      "author_full_name": "Martin Grasshoff",
+      "author_email": "martin.grasshoff@protonmail.com",
+      "github_user": "grasshoffm",
+      "github_repo": "spatial_sigurd_py",
+      "license": "MIT License",
+      "ide_integration": true,
+      "issue_categorization": "issue types",
+      "_copy_without_render": [
+        ".github/workflows/build.yaml",
+        ".github/workflows/test.yaml",
+        "docs/_templates/autosummary/**.rst"
+      ],
+      "_exclude_on_template_update": [
+        "CHANGELOG.md",
+        "LICENSE",
+        "README.md",
+        "docs/api.md",
+        "docs/index.md",
+        "docs/notebooks/example.ipynb",
+        "docs/references.bib",
+        "docs/references.md",
+        "src/**",
+        "tests/**"
+      ],
+      "_render_devdocs": false,
+      "_jinja2_env_vars": {
+        "lstrip_blocks": true,
+        "trim_blocks": true
+      },
+      "_template": "https://github.com/scverse/cookiecutter-scverse",
+      "_commit": "bc020b0f1e2afa227ed6fee242120ab80daaf32c"
+    }
+  },
+  "directory": null
+}

@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = [ "hatchling" ]
 
 [project]
-name = "spatial_sigurd_py"
+name = "spatial-sigurd-py"
 version = "0.0.1"
 description = "Python implementation of SIGURD with spatial clone detection."
 readme = "README.md"
