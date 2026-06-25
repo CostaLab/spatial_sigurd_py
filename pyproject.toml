@@ -24,6 +24,11 @@ classifiers = [
 ]
 dependencies = [
   "anndata",
+  "cyvcf2",
+  "numpy",
+  "pandas",
+  "polars",
+  "scipy",
   # for debug logging (referenced from the issue template)
   "session-info2",
 ]
