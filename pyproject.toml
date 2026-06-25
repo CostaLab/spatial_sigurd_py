@@ -103,12 +103,14 @@ lint.ignore = [
   "D107", # Missing docstring in __init__
   # Disable one in each pair of mutually incompatible rules
   "D203", # We don’t want a blank line before a class docstring
+  "D205", # I want to preserve the indentations for the empty lines. This helps me read the code.
   "D213", # <> We want docstrings to start immediately after the opening triple quote
   "D400", # first line should end with a period [Bug: doesn’t work with single-line docstrings]
   "D401", # First line should be in imperative mood; try rephrasing
   "E501", # line too long -> we accept long comment lines; formatter gets rid of long code lines
   "E731", # Do not assign a lambda expression, use a def -> lambda expression assignments are convenient
   "E741", # allow I, O, l as variable names -> I is the identity matrix
+  "W293", # I want to preserve the indentations for the empty lines. This helps me read the code.
 ]
 lint.per-file-ignores."*/__init__.py" = [ "F401" ]
 lint.per-file-ignores."docs/*" = [ "I" ]

@@ -18,16 +18,6 @@ in particular, the [API documentation][].
 You need to have Python 3.11 or newer installed on your system.
 If you don't have Python installed, we recommend installing [uv][].
 
-There are several alternative options to install spatial_sigurd_py:
-
-<!--
-1) Install the latest release of `spatial_sigurd_py` from [PyPI][]:
-
-```bash
-pip install spatial_sigurd_py
-```
--->
-
 1. Install the latest development version:
 
 ```bash
