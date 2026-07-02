@@ -11,10 +11,10 @@ from spatial_sigurd_py._utils import _to_array
 # Since _build_consensus is unused for now, we have to import it directly.
 from spatial_sigurd_py._utils.basic import _build_consensus
 
+
 ###############################################################################
 # Testing _to_array
 ###############################################################################
-
 # Function to make an AnnData object. This will be used in the function
 # test_sparse_layer_returns_transposed_dense_float32
 def _make_adata(layer):
