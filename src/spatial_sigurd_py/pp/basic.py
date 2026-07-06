@@ -689,7 +689,7 @@ def Pruning(
         alt_rows = alt_reads.indices[a0:a1]
         alt_data = alt_reads.data[a0:a1]
         
-        expressed_mask = alt_data > min_alt_reads
+        expressed_mask = alt_data >= min_alt_reads
         pos_rows = alt_rows[expressed_mask]
         
         if pos_rows.size == 0:
