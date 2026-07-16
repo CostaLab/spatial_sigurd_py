@@ -1,3 +1,3 @@
-from spatial_sigurd_py._utils import _to_array
+from spatial_sigurd_py._utils.basic import _to_array
 
-from .basic import Filtering, Pruning
+from .basic import Filtering, Pruning, build_within_radius_neighborlists

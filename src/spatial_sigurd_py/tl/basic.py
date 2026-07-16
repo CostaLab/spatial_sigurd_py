@@ -5,7 +5,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-from spatial_sigurd_py._utils import _to_array
+from spatial_sigurd_py._utils.basic import _strand_concordance
 
 
 def Variant_Selection_VMR(
@@ -46,72 +46,87 @@ def Variant_Selection_VMR(
     # immediately defined for all parts below.
     small_epsilon = 1e-11
     vnames = adata.var_names  # variants
-    n_vars = len(vnames)
     
     # 1. Basic matrices
     if verbose:
         print("Calculating basic matrices.")
     # end if statement
     
-    alts = _to_array("alt_reads", adata_object=adata)  # variants × cells
-    coverage = _to_array("coverage", adata_object=adata)
-    fw_reads = _to_array("alt_fwd", adata_object=adata)
-    rev_reads = _to_array("alt_rev", adata_object=adata)
+    alt_reads = adata.layers["alt_reads"].tocsc()
+    coverage  = adata.layers["coverage"].tocsc()
+    n_cells   = coverage.shape[0]
     
-    # Allele frequency per cell
-    with np.errstate(divide="ignore", invalid="ignore"):
-        fraction = alts / coverage
+    # Per-variant allele frequency: sums reduce over cells (axis 0), since layers
+    # are cells x variants. mean_af is length n_vars.
+    sum_alts     = np.asarray(alt_reads.sum(axis=0)).ravel().astype(np.float64)
+    sum_coverage = np.asarray(coverage.sum(axis=0)).ravel().astype(np.float64)
+    mean_af = np.divide(
+        sum_alts, sum_coverage,
+        out=np.zeros(alt_reads.shape[1], dtype=np.float64),
+        where=sum_coverage > 0,
+    )
     
-    fraction[np.isnan(fraction)] = 0.0
+    # Per-variant mean coverage (axis 0).
+    mean_cov = np.asarray(coverage.mean(axis=0)).ravel()
+    del sum_alts, sum_coverage
     
-    # Means over *all* cells
-    sum_alts = alts.sum(axis=1)  # per-variant due to 1
-    sum_coverage = coverage.sum(axis=1)
-    mean_af = np.divide(sum_alts, sum_coverage, out=np.zeros_like(sum_alts, dtype=np.float32), where=sum_coverage > 0)
-    # Cleaning up a couple of unnecessary variables.
-    del sum_coverage
-    del sum_alts
-    del alts
-    mean_cov = np.array(coverage.mean(axis=1)).flatten()
-    
-    # 2. Strand concordance  (= Pearson between fw & rev per variant)
-    # Each cell is an observation.
+    # 2. Strand concordance, sparse-native, in variant order.
     if verbose:
         print("Computing strand concordance.")
+    # end if statement
     
-    strand_corr = np.empty(n_vars, dtype=np.float32)
-    for i in range(n_vars):
-        fw = fw_reads[i]
-        rv = rev_reads[i]
-        mask = (fw > 0) | (rv > 0)  # ignore all-zero cells --> no signal
-        if mask.sum() < 2:
-            strand_corr[i] = np.nan
-        else:
-            strand_corr[i] = np.corrcoef(fw[mask], rv[mask])[0, 1]
+    fw_reads  = adata.layers["alt_fwd"]
+    rev_reads = adata.layers["alt_rev"]
+    strand_concordance = pd.Series(
+        _strand_concordance(fw_reads, rev_reads),
+        index=vnames,
+        dtype=np.float64,
+    )
     
-    # 3. Optional variance stabilisation
+    # 3-4. Per-variant VAF variance with optional low-coverage stabilisation.
+    # The stabilised fraction is dense by nature -- every cell below threshold
+    # (the majority at HD scale, structural zeros included) is overwritten with
+    # the variant's mean_af -- so it is never materialised. Instead the variance
+    # is closed-form from moment sums: high-coverage cells keep their stored VAF,
+    # the n_L low-coverage cells each contribute exactly mean_af.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cov_inv = coverage.astype(np.float64, copy=True)
+        cov_inv.data = 1.0 / cov_inv.data
+    # end with statement
+    fraction = alt_reads.astype(np.float64).multiply(cov_inv).tocsc()
+    
     if stabilize_variance:
         if verbose:
             print("Stabilising variance for low-coverage cells.")
-        
-        low_cov_rows, low_cov_cols = np.where(coverage < low_coverage_threshold)
-        # Replace the masked positions with the variant means.
-        fraction[low_cov_rows, low_cov_cols] = mean_af[low_cov_rows]
-        del low_cov_rows
+        # end if statement
     
-    # 4. Row variance (ddof = 1 → sample variance, like MatrixGenerics)
-    variants_variance = np.var(fraction, axis=1, ddof=1)
+        mask_H = coverage >= low_coverage_threshold           # sparse; keeps VAF here
+        n_H = np.asarray(mask_H.sum(axis=0)).ravel().astype(np.float64)
+        n_L = n_cells - n_H                                    # take mean_af here
+    
+        frac_H = fraction.multiply(mask_H)
+        S  = np.asarray(frac_H.sum(axis=0)).ravel() + n_L * mean_af
+        SS = np.asarray(frac_H.multiply(frac_H).sum(axis=0)).ravel() + n_L * mean_af * mean_af
+    else:
+        S  = np.asarray(fraction.sum(axis=0)).ravel()
+        SS = np.asarray(fraction.multiply(fraction).sum(axis=0)).ravel()
+    # end if statement
+    
+    with np.errstate(divide="ignore", invalid="ignore"):
+        variants_variance = (SS - S * S / n_cells) / (n_cells - 1)
+    # end with statement
     del fraction
     
     # 5. Cells detected  (fw ≥ N **and** rev ≥ N)
-    detected = (fw_reads >= minimum_fw_rev_reads) & (rev_reads >= minimum_fw_rev_reads)
+    detected = (fw_reads >= minimum_fw_rev_reads).multiply(rev_reads >= minimum_fw_rev_reads)
     del fw_reads
     del rev_reads
-    cells_detected = detected.sum(axis=1)
+    cells_detected = np.asarray(detected.sum(axis=0)).ravel()
     
     # 6.  Assemble the VOI table
     if verbose:
         print("Assembling final DataFrame.")
+    # end if statement
     
     voi = pd.DataFrame(
         data={
@@ -121,7 +136,7 @@ def Variant_Selection_VMR(
             "mean": mean_af.round(7),
             "variance": variants_variance.round(7),
             "cells_detected": cells_detected,
-            "strand_correlation": strand_corr,
+            "strand_correlation": strand_concordance,
             "mean_coverage": mean_cov,
         },
         index=vnames,
@@ -139,6 +154,7 @@ def _shannon(counts: np.ndarray, base: float = np.e) -> float:
     total = counts.sum()
     if total <= 0:
         return 0.0
+    # end if statement
     
     p = counts / total
     p = p[p > 0]
@@ -151,6 +167,7 @@ def _simpson_index(counts: np.ndarray) -> float:
     total = counts.sum()
     if total <= 0:
         return 0.0
+    # end if statement
     
     p = counts / total
     return 1.0 - np.sum(p * p)
@@ -161,6 +178,7 @@ def _inv_simpson(counts: np.ndarray) -> float:
     total = counts.sum()
     if total <= 0:
         return 0.0
+    # end if statement
     
     p2_sum = np.sum((counts / total) ** 2)
     return (1.0 / p2_sum) if p2_sum > 0 else 0.0
@@ -203,6 +221,7 @@ def ClonalDiversity(
     supported = {"EffectiveSpecies", "shannon", "simpson", "invsimpson"}
     if diversity_measure not in supported:
         raise ValueError(f"Your diversity measure '{diversity_measure}' is not supported.")
+    # end if statement
     
     # Get obs dataframe
     if isinstance(adata, ad.AnnData):
@@ -211,6 +230,7 @@ def ClonalDiversity(
         obs = adata
     else:
         raise TypeError("Provide an AnnData or a pandas.DataFrame with per cell metadata.")
+    # end if statement
     
     # Subset cells if requested
     if cells is not None:
@@ -218,18 +238,23 @@ def ClonalDiversity(
         missing = [c for c in cells if c not in obs.index]
         if missing:
             raise ValueError(f"Not all your cells are present in the object. Missing (first 5): {missing[:5]}")
+        # end if statement
         
         if verbose:
             print("Subsetting to requested cells.")
+        # end if statement
         
         obs = obs.loc[cells]
+    # end if statement
     
     # Check grouping column
     if grouping is None:
         raise ValueError("You must provide a 'grouping' column name.")
+    # end if statement
     
     if grouping not in obs.columns:
         raise KeyError(f"Your grouping variable '{grouping}' is not in the object metadata.")
+    # end if statement
     
     # Counts per group (like data.frame(table(clones)) in R)
     counts = obs[grouping].value_counts(dropna=False).to_numpy(dtype=float)
@@ -237,16 +262,20 @@ def ClonalDiversity(
     # Compute diversity
     if diversity_measure == "shannon":
         return float(_shannon(counts, base=base))
+    # end if statement
     
     if diversity_measure == "simpson":
         return float(_simpson_index(counts))
+    # end if statement
     
     if diversity_measure == "invsimpson":
         return float(_inv_simpson(counts))
+    # end if statement
     
     if diversity_measure == "EffectiveSpecies":
         H = _shannon(counts, base=base)
         return float(base**H)
+    # end if statement
     
     # Shouldn't reach here
     raise RuntimeError("Unexpected branch in ClonalDiversity.")

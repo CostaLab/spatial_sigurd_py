@@ -1,3 +1,7 @@
-from spatial_sigurd_py._utils import _to_array
-
-from .basic import LoadingMAEGATK_typewise, LoadingMGATK_typewise, load_vartrix_typewise
+from spatial_sigurd_py._utils.basic import _to_array
+from .basic import (
+    Load_VarTrix_typewise,
+    LoadingMAEGATK_typewise,
+    LoadingMAEGATK_typewise_visiumHD,
+    LoadingMGATK_typewise,
+)
