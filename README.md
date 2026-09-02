@@ -30,8 +30,7 @@ See the [changelog][].
 
 ## Contact
 
-For questions and help requests, you can reach out in the [scverse discourse][].
-If you found a bug, please use the [issue tracker][].
+For questions, bugs and help requests, please use the [issue tracker][].
 
 ## Citation
 

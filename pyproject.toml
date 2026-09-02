@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "spatial-sigurd-py"
-version = "0.0.1"
+version = "0.1.0"
 description = "Python implementation of SIGURD with spatial clone detection."
 readme = "README.md"
 license = { file = "LICENSE" }
