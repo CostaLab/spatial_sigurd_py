@@ -1,1 +1,1 @@
-from .basic import ClonalDiversity, Variant_Selection_VMR
+from .basic import ClonalDiversity, Spatial_Clone_Detection, Variant_Selection_VMR

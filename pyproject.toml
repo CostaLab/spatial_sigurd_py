@@ -25,12 +25,26 @@ classifiers = [
 dependencies = [
   "anndata",
   "cyvcf2",
+  "gseapy",
+  "kneed",
+  "louvain",
+  "matplotlib",
+  "networkx",
   "numpy",
-  "pandas",
+  "pandas>=2,<3",
+  "pillow",
+  "plotnine",
   "polars",
+  "pyarrow",
+  "scanpy",
+  "scikit-learn",
   "scipy",
+  "seaborn",
   # for debug logging (referenced from the issue template)
   "session-info2",
+  "setuptools<82",
+  "spagft",
+  "statsmodels",
 ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://spatial_sigurd_py.readthedocs.io/"
@@ -81,6 +95,30 @@ envs.hatch-test.overrides.matrix.deps.env-vars = [
   { value = "allow", key = "UV_PRERELEASE", if = [ "pre" ] },
 ]
 envs.hatch-test.dependency-groups = [ "dev", "test" ]
+
+[tool.uv]
+override-dependencies = [
+  "chardet; sys_platform == 'never'",
+  "charset-normalizer; sys_platform == 'never'",
+  "gseapy>=1",
+  "igraph>=0.10,<0.12",
+  "kneed==0.7.0",
+  # SpaGFT declares these but never imports them
+  "leidenalg; sys_platform == 'never'",
+  # needed by sc.tl.louvain inside identify_ftu
+  "louvain>=0.8",
+  "matplotlib>=3.8",
+  "networkx>=3",
+  # numba must stay real - scanpy and umap-learn need it
+  "numba>=0.60",
+  "numpy>=2",
+  "pandas>=2,<3",
+  "plotnine>=0.13",
+  "scanpy>=1.10",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "setuptools<82",
+]
 
 [tool.ruff]
 line-length = 120

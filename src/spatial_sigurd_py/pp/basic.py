@@ -707,6 +707,7 @@ def Pruning(
     spatial_key: str = "spatial",
     x_col=None,
     y_col=None,
+    min_alt_reads: int = 0,
     neighbor_mode: Literal["hops", "radius", "knn"] = "hops",
     radius_factor: float = 1.25,
     k_hops: int = 2,
@@ -892,7 +893,7 @@ def Pruning(
         alt_rows = alt_reads.indices[a0:a1]
         alt_data = alt_reads.data[a0:a1]
 
-        expressed_mask = alt_data >= 1
+        expressed_mask = alt_data >= min_alt_reads
         pos_rows = alt_rows[expressed_mask]
 
         if pos_rows.size == 0:
