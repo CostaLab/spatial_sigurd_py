@@ -10,6 +10,7 @@ Python implementation of SIGURD with spatial clone detection.
 
 ## Getting started
 
+To be established. Place holder for now.
 Please refer to the [documentation][],
 in particular, the [API documentation][].
 
