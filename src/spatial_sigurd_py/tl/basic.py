@@ -779,6 +779,7 @@ def Spatial_Clone_Detection(
     # numpy.lexsort treats the last key as the most important.
     coords_order = np.lexsort((coords[:, 0], coords[:, 1]))
     adata = adata[coords_order, :].copy()
+    adata.obsm[spatial_key] = coords[coords_order].astype(np.float64, copy=True)
     adata.obs["array_col"] = coords[coords_order, 0]
     adata.obs["array_row"] = coords[coords_order, 1]
 
