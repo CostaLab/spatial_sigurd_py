@@ -3,7 +3,7 @@
 [![Tests][badge-tests]][tests]
 [![Documentation][badge-docs]][documentation]
 
-[badge-tests]: https://img.shields.io/github/actions/workflow/status/grasshoffm/spatial_sigurd_py/test.yaml?branch=main
+[badge-tests]: https://img.shields.io/github/actions/workflow/status/CostaLab/spatial_sigurd_py/test.yaml?branch=main
 [badge-docs]: https://app.readthedocs.org/projects/spatial_sigurd_py/badge/
 
 Python implementation of SIGURD with spatial clone detection.
@@ -22,7 +22,7 @@ If you don't have Python installed, we recommend installing [uv][].
 1. Install the latest development version:
 
 ```bash
-pip install git+https://github.com/grasshoffm/spatial_sigurd_py.git@main
+pip install git+https://github.com/CostaLab/spatial_sigurd_py.git@main
 ```
 
 ## Release notes
@@ -39,8 +39,8 @@ For questions, bugs and help requests, please use the [issue tracker][].
 
 [uv]: https://github.com/astral-sh/uv
 [scverse discourse]: https://discourse.scverse.org/
-[issue tracker]: https://github.com/grasshoffm/spatial_sigurd_py/issues
-[tests]: https://github.com/grasshoffm/spatial_sigurd_py/actions/workflows/test.yaml
+[issue tracker]: https://github.com/CostaLab/spatial_sigurd_py/issues
+[tests]: https://github.com/CostaLab/spatial_sigurd_py/actions/workflows/test.yaml
 [documentation]: https://spatial_sigurd_py.readthedocs.io
 [changelog]: https://spatial_sigurd_py.readthedocs.io/page/changelog.html
 [api documentation]: https://spatial_sigurd_py.readthedocs.io/page/api.html
