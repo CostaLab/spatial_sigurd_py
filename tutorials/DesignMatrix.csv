@@ -1,0 +1,4 @@
+patient,sample,source,type,bam,molecule_info,input_path,cells
+Patient1,Sample1,MGATK,ATAC,-,-,/path/to/MGATK/Sample1/final/,/path/to/barcodes/Sample1.tsv
+Patient2,Sample2,MGATK,ATAC,-,-,/path/to/MGATK/Sample2/final/,/path/to/barcodes/Sample2.tsv
+Patient3,Sample3,MGATK,ATAC,-,-,/path/to/MGATK/Sample3/final/,/path/to/barcodes/Sample3.tsv
