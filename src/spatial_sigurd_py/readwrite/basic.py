@@ -590,7 +590,7 @@ def LoadingMGATK_typewise(
     -- design_matrix_path: Design matrix of the experiments. From here the other
                            information like location of the barcodes files are retrieved.
     -- patient_column: What is the patient column called in the design matrix?
-    -- reference_path: Where is the genomic reference located? It should be
+    -- reference_path: Where is the genomic reference located? It should be in the
                        MGATK output folder, but any reference can be used.
     -- chromosome_prefix: What is the prefix for the chromosome? This prefix is
                           added to each variant.
