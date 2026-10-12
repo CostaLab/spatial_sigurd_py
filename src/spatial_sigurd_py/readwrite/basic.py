@@ -11,7 +11,7 @@ import scipy.sparse as sp
 from cyvcf2 import VCF
 from scipy.io import mmread
 
-from spatial_sigurd_py._utils.basic import (
+from spatial_sigurd_py._utils import (
     _avg_coverage_per_variant,
     _safe_div_sparse,
     _strand_concordance,
@@ -97,10 +97,10 @@ def _subset(mat: sp.csr_matrix, keep: Sequence[bool]) -> sp.csr_matrix:
     return mat[:, keep]
 
 
-def _pl_pos_to_pd(tbl: pl.DataFrame) -> pd.DataFrame:
+def _pl_pos_to_pd(tbl: pl.DataFrame, dtype=np.int64) -> pd.DataFrame:
     df_pd = tbl.to_pandas()
     df_pd.set_index("position", inplace=True)
-    return df_pd.astype(np.int64, copy=False)
+    return df_pd.astype(dtype, copy=False)
 
 
 def _df_to_csc(df: pd.DataFrame, dtype=np.float32) -> sp.csc_matrix:
@@ -419,11 +419,17 @@ def Load_VarTrix_typewise(
         # prepend sample to barcodes
         bc = barcodes[sample]["barcode"].astype(str).tolist()
         cols = [f"{sample}_{b}" for b in bc]
-        cm._shape = (cm.shape[0], len(cols))
-        rm._shape = (rm.shape[0], len(cols))
-        xm._shape = (xm.shape[0], len(cols))
+        for matrix_file_name, sparse_matrix in (
+            ("out_matrix_coverage.mtx", cm),
+            ("ref_matrix_coverage.mtx", rm),
+            ("out_matrix_consensus.mtx", xm),
+        ):
+            if sparse_matrix.shape[1] != len(cols):
+                raise ValueError(
+                    f"Sample {sample}: {matrix_file_name} has {sparse_matrix.shape[1]} columns, "
+                    f"but the barcode file has {len(cols)} barcodes."
+                )
 
-        _ = cm.indices  # force indices to initialize. We assign the values to _ since ruff will complain otherwise.
         cm = sp.csr_matrix(cm)
         rm = sp.csr_matrix(rm)
         xm = sp.csr_matrix(xm)
@@ -444,8 +450,8 @@ def Load_VarTrix_typewise(
     gc.collect()
 
     # 6. cell filtering
-    cols = sum((cov.columns.tolist() for cov in barcodes.values()), [])
     col_labels = [f"{s}_{b}" for s in samples for b in barcodes[s]["barcode"]]
+    col_samples = [sample_name for sample_name in samples for _ in barcodes[sample_name]["barcode"]]
 
     if cells_include is not None:
         if verbose:
@@ -458,6 +464,8 @@ def Load_VarTrix_typewise(
         coverage = _subset(coverage, mask)
         reference = _subset(reference, mask)
         consensus = _subset(consensus, mask)
+        col_labels = [label for label, keep in zip(col_labels, mask, strict=True) if keep]
+        col_samples = [sample_name for sample_name, keep in zip(col_samples, mask, strict=True) if keep]
 
     if cells_exclude is not None:
         if verbose:
@@ -471,6 +479,8 @@ def Load_VarTrix_typewise(
         coverage = _subset(coverage, mask)
         reference = _subset(reference, mask)
         consensus = _subset(consensus, mask)
+        col_labels = [label for label, keep in zip(col_labels, mask, strict=True) if keep]
+        col_samples = [sample_name for sample_name, keep in zip(col_samples, mask, strict=True) if keep]
 
     # 7. apply min_reads threshold
     if min_reads is not None:
@@ -481,6 +491,11 @@ def Load_VarTrix_typewise(
         # zero out low reads in-place
         reference.data[reference.data < min_reads] = 0
         coverage.data[coverage.data < min_reads] = 0
+        # Dropping the entries that were just set to zero.
+        # Otherwise they stay stored, count as "reference" in ref_bin and
+        # give 0/0 in the fraction layer.
+        reference.eliminate_zeros()
+        coverage.eliminate_zeros()
 
         # binary indicators
         ref_bin = reference.copy()
@@ -502,7 +517,7 @@ def Load_VarTrix_typewise(
         {
             "Cell": col_labels,
             "Patient": patient,
-            "Sample": [c.split("_", 1)[0] for c in col_labels],
+            "Sample": col_samples,
             "Type": type_use,
             **{"AverageCoverage": np.asarray(coverage.mean(axis=0)).ravel()},
         },
@@ -522,7 +537,7 @@ def Load_VarTrix_typewise(
     consensus = consensus[keep_var, :]
     coverage = coverage[keep_var, :]
     reference = reference[keep_var, :]
-    var = var.loc[new_names[keep_var], :]
+    var = var.iloc[keep_var, :]
 
     if verbose:
         print("Filtering cells with all zeros.")
@@ -554,11 +569,12 @@ def Load_VarTrix_typewise(
     if verbose:
         print("Assembling AnnData.")
 
-    adata = ad.AnnData(X=consensus, obs=obs, var=var)
-    adata.layers["fraction"] = fraction
-    adata.layers["coverage"] = reads
-    adata.layers["alts"] = coverage
-    adata.layers["refs"] = reference
+    # The matrices are variants x cells up to here; AnnData needs cells x variants.
+    adata = ad.AnnData(X=consensus.T.tocsc(), obs=obs, var=var)
+    adata.layers["fraction"] = fraction.T.tocsc()
+    adata.layers["coverage"] = reads.T.tocsc()
+    adata.layers["alts"] = coverage.T.tocsc()
+    adata.layers["refs"] = reference.T.tocsc()
 
     return adata
 
@@ -650,7 +666,15 @@ def LoadingMGATK_typewise(
         for alt in ("A", "C", "G", "T")
         if alt != ref
     ]
-    mut_positions = [int(m.split("_")[1]) for m in muts]
+    mut_positions = np.array(
+        [
+            int(position)
+            for position, reference_base in zip(ref_df["position"], ref_df["ref_base"], strict=True)
+            for alternative_base in ("A", "C", "G", "T")
+            if alternative_base != reference_base
+        ],
+        dtype=np.int32,
+    )
 
     alt_fwd_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.int64, 0))
     alt_rev_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.int64, 0))
@@ -1063,9 +1087,13 @@ def LoadingMAEGATK_typewise(
         sep="\t",
         header=None,
         names=["position", "ref_base"],
-        dtype={"position": np.int32},
+        dtype={"position": np.int64},
     )
     ref_df["ref_base"] = ref_df["ref_base"].str.upper()
+    # rCRS position 3107 is "N". Every base differs from "N", so it would give four
+    # variants without reference reads.
+    # Since this is still data, we still record it.
+    # ref_df = ref_df[ref_df["ref_base"].isin(["A", "C", "G", "T"])].reset_index(drop=True)
 
     muts = [
         f"{chromosome_prefix}_{pos}_{ref}>{alt}"
@@ -1073,10 +1101,15 @@ def LoadingMAEGATK_typewise(
         for alt in ("A", "C", "G", "T")
         if alt != ref
     ]
-    mut_positions = [int(m.split("_")[1]) for m in muts]
+    # We take the positions from ref_df.
+    mut_positions = [
+        int(position)
+        for position, reference_base in zip(ref_df["position"], ref_df["ref_base"], strict=True)
+        for alternative_base in ("A", "C", "G", "T")
+        if alternative_base != reference_base
+    ]
 
-    # Pre-allocate global tables as INT32/FLOAT32.
-    alt_fwd_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.int32, 0))
+    alt_fwd_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.int64, 0))
     alt_fwd_qual_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.float32, 0.0))
     alt_rev_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.int32, 0))
     alt_rev_qual_global = pd.DataFrame(index=muts, dtype=pd.SparseDtype(np.float32, 0.0))
@@ -1140,7 +1173,7 @@ def LoadingMAEGATK_typewise(
 
         if not cell_barcodes:
             if verbose:
-                print("No barcodes left after cell barcode filtering. Skipping sample {sample_use}.", flush=True)
+                print(f"No barcodes left after cell barcode filtering. Skipping sample {sample_use}.", flush=True)
 
             continue
 
@@ -1315,7 +1348,7 @@ def LoadingMAEGATK_typewise(
         )
         ref_fwd_pd = _align_cols(ref_fwd_pd, all_cell_barcodes, pd.SparseDtype(np.int32, 0))
 
-        ref_fwd_qual_pos_pd = _pl_pos_to_pd(ref_fwd_qual_pos)
+        ref_fwd_qual_pos_pd = _pl_pos_to_pd(ref_fwd_qual_pos, dtype=np.float32)
         ref_fwd_qual_pos_pd.columns = [f"{sample_use}_{c}" for c in ref_fwd_qual_pos_pd.columns]
         ref_fwd_qual_pd = (
             ref_fwd_qual_pos_pd.reindex(index=mut_positions, fill_value=0)
@@ -1333,12 +1366,12 @@ def LoadingMAEGATK_typewise(
         )
         ref_rev_pd = _align_cols(ref_rev_pd, all_cell_barcodes, pd.SparseDtype(np.int32, 0))
 
-        ref_rev_qual_pos_pd = _pl_pos_to_pd(ref_rev_qual_pos)
+        ref_rev_qual_pos_pd = _pl_pos_to_pd(ref_rev_qual_pos, dtype=np.float32)
         ref_rev_qual_pos_pd.columns = [f"{sample_use}_{c}" for c in ref_rev_qual_pos_pd.columns]
         ref_rev_qual_pd = (
             ref_rev_qual_pos_pd.reindex(index=mut_positions, fill_value=0)
             .set_index(pd.Index(muts, name="mutation"))
-            .astype(pd.SparseDtype(pd.SparseDtype(np.int32, 0), 0.0), copy=False)
+            .astype(pd.SparseDtype(np.float32, 0.0), copy=False)
         )
         ref_rev_qual_pd = _align_cols(ref_rev_qual_pd, all_cell_barcodes, pd.SparseDtype(np.float32, 0.0))
 
@@ -1514,6 +1547,33 @@ def LoadingMAEGATK_typewise(
         print("We calculate the mean coverage.", flush=True)
 
     coverage_pos_global = coverage_pos_global.astype(pd.SparseDtype(np.int32, 0), copy=False)
+
+    # maegatk computes the coverage as the sum of the A/C/G/T counts over both strands.
+    # This means that a coverage can have a higher coverage than alt_reads + ref_reads.
+    # alt_reads + ref_reads > coverage therefore means that the base files and the
+    # coverage file do not come from the same counting run.
+    if verbose:
+        print("We check that alt_reads + ref_reads <= coverage.", flush=True)
+
+    alt_reads_matrix = _df_to_csc_sparse(alt_reads, dtype=np.int64)  # cells x variants
+    ref_reads_matrix = _df_to_csc_sparse(ref_reads, dtype=np.int64)
+    coverage_matrix = _df_to_csc_sparse(coverage_pos_global, dtype=np.int64)
+    excess_reads = (alt_reads_matrix + ref_reads_matrix - coverage_matrix).tocoo()
+    violation_mask = excess_reads.data > 0
+    if violation_mask.any():
+        number_of_violations = int(violation_mask.sum())
+        example_cells = alt_reads.columns[excess_reads.row[violation_mask][:5]]
+        example_variants = alt_reads.index[excess_reads.col[violation_mask][:5]]
+        examples = ", ".join(
+            f"({cell}, {variant})" for cell, variant in zip(example_cells, example_variants, strict=True)
+        )
+        raise ValueError(
+            f"{number_of_violations} (cell, variant) entries have alt_reads + ref_reads > coverage. "
+            "The base files and the coverage file do not come from the same maegatk run. "
+            f"First entries: {examples}"
+        )
+
+    del alt_reads_matrix, ref_reads_matrix, coverage_matrix, excess_reads, violation_mask
 
     if verbose:
         print("We calculate the fraction.", flush=True)
@@ -1693,6 +1753,10 @@ def LoadingMAEGATK_typewise_visiumHD(
         dtype={"position": np.int32},
     )
     ref_df["ref_base"] = ref_df["ref_base"].str.upper()
+    # rCRS position 3107 is "N". Every base differs from "N", so it would give four
+    # variants without reference reads.
+    # Since this is still data, we still record it.
+    # ref_df = ref_df[ref_df["ref_base"].isin(["A", "C", "G", "T"])].reset_index(drop=True)
 
     muts = [
         f"{chromosome_prefix}_{pos}_{ref}>{alt}"
@@ -1704,9 +1768,19 @@ def LoadingMAEGATK_typewise_visiumHD(
     n_vars = muts.size
 
     if verbose:
-        print("Position repeated 3x (one per alt != ref).", flush=True)
+        print("Position repeated 3x (one per alt != ref). Unless for reference N, then it is 4.", flush=True)
 
-    mut_positions = np.array([int(m.split("_")[1]) for m in muts], dtype=np.int32)
+    # Bug 12: take the positions from ref_df instead of parsing the mutation names,
+    # which breaks when chromosome_prefix contains "_".
+    mut_positions = np.array(
+        [
+            int(position)
+            for position, reference_base in zip(ref_df["position"], ref_df["ref_base"], strict=True)
+            for alternative_base in ("A", "C", "G", "T")
+            if alternative_base != reference_base
+        ],
+        dtype=np.int32,
+    )
 
     ref_pl = pl.DataFrame(ref_df)
 
@@ -1772,7 +1846,7 @@ def LoadingMAEGATK_typewise_visiumHD(
         del maps
         gc.collect()
 
-        cell_ids = bam_cell_map.select("cell_id").unique().to_series().to_list()
+        cell_ids = bam_cell_map.select("cell_id").unique().sort("cell_id").to_series().to_list()
         cell_ids = list(cell_ids)
         n_cells = len(cell_ids)
 
@@ -2037,12 +2111,28 @@ def LoadingMAEGATK_typewise_visiumHD(
     if verbose:
         print("Fraction.", flush=True)
 
-    missing = alt_reads.astype(bool) > cov_mat.astype(bool)
-    if missing.nnz:
-        raise ValueError(
-            f"{missing.nnz} (cell, variant) entries have alt_reads > 0 but coverage == 0. "
-            "Base files and coverage file disagree."
+    # maegatk computes the coverage as the sum of the A/C/G/T counts over both strands.
+    # This means that a coverage can have a higher coverage than alt_reads + ref_reads.
+    # alt_reads + ref_reads > coverage therefore means that the base files and the
+    # coverage file do not come from the same counting run.
+    excess_reads = (
+        alt_reads.astype(np.int64) + ref_reads.astype(np.int64) - cov_mat.astype(np.int64)
+    ).tocoo()  # cells x variants
+    violation_mask = excess_reads.data > 0
+    if violation_mask.any():
+        number_of_violations = int(violation_mask.sum())
+        example_cells = [all_obs_names[row_index] for row_index in excess_reads.row[violation_mask][:5]]
+        example_variants = muts_kept[excess_reads.col[violation_mask][:5]]
+        examples = ", ".join(
+            f"({cell}, {variant})" for cell, variant in zip(example_cells, example_variants, strict=True)
         )
+        raise ValueError(
+            f"{number_of_violations} (cell, variant) entries have alt_reads + ref_reads > coverage. "
+            "The base files and the coverage file do not come from the same maegatk run. "
+            f"First entries: {examples}"
+        )
+
+    del excess_reads, violation_mask
 
     fraction = _safe_div_sparse(alt_reads, cov_mat)
 
