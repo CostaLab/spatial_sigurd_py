@@ -2,7 +2,7 @@ import gc
 import math
 import traceback
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from numbers import Integral, Real
 from typing import Literal
 
@@ -10,6 +10,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import scipy.sparse as sp
 import SpaGFT as spg
 
 from spatial_sigurd_py._exceptions import FTUWarning, SpotFilterWarning
@@ -41,6 +42,33 @@ def _drop_ftu_results(adata):
         store = getattr(adata, slot)
         if key in store:
             del store[key]
+
+
+_PCA_SIDE_EFFECT_KEYS = (
+    ("obsm", "X_pca"),
+    ("varm", "PCs"),
+    ("uns", "pca"),
+)
+
+
+def _snapshot_slots(adata, slot_keys):
+    """Remember the current value of every given slot that exists."""
+    snapshot = {}
+    for slot, key in slot_keys:
+        store = getattr(adata, slot)
+        if key in store:
+            snapshot[(slot, key)] = store[key]
+    return snapshot
+
+
+def _restore_slots(adata, slot_keys, snapshot):
+    """Reset the given slots to the snapshot, removing anything added since."""
+    for slot, key in slot_keys:
+        store = getattr(adata, slot)
+        if key in store:
+            del store[key]
+        if (slot, key) in snapshot:
+            store[key] = snapshot[(slot, key)]
 
 
 def Variant_Selection_VMR(
@@ -109,7 +137,7 @@ def Variant_Selection_VMR(
     ####################################################################################################
     # 0. Helpers & aliases
     # These are parameters that are used in the function and I do not want to
-    # supply as specific parameters. They are not important enough or can
+    # supply as specific parameters. They are not important enough or can be
     # immediately defined for all parts below.
     small_epsilon = 1e-11
     vnames = adata.var_names  # variants
@@ -179,6 +207,11 @@ def Variant_Selection_VMR(
     with np.errstate(divide="ignore", invalid="ignore"):
         variants_variance = (SS - S * S / n_cells) / (n_cells - 1)
     # end with statement
+
+    # SS - S^2/n cancels catastrophically when (nearly) every cell holds the same value,
+    # e.g. a variant whose cells are all below low_coverage_threshold. The result can then
+    # be a tiny negative number, while the true variance is >= 0. NaN (n_cells == 1) stays NaN.
+    variants_variance = np.maximum(variants_variance, 0.0)
     del fraction
 
     # 5. Cells detected  (fw >= N and rev >= N).
@@ -197,11 +230,16 @@ def Variant_Selection_VMR(
     # end if statement
 
     vmr = variants_variance / (mean_af + small_epsilon)
+    # A variant without variance has VMR 0, so its log10 is -inf. That is the correct value.
+    with np.errstate(divide="ignore"):
+        vmr_log10 = np.log10(vmr)
+    # end with statement
+
     voi = pd.DataFrame(
         data={
             "variant": vnames,
             "vmr": vmr,
-            "vmr_log10": np.log10(vmr),
+            "vmr_log10": vmr_log10,
             "mean": mean_af.round(7),
             "variance": variants_variance.round(7),
             "cells_detected": cells_detected,
@@ -289,6 +327,13 @@ def ClonalDiversity(
     if not isinstance(verbose, (bool, np.bool_)):
         raise TypeError(f"verbose must be bool. You supplied a {type(verbose).__name__}.")
 
+    # base is the base of a logarithm: log(1) = 0 would divide by zero, and log of a
+    # non-positive number is undefined.
+    if isinstance(base, (bool, np.bool_)) or not isinstance(base, Real):
+        raise TypeError(f"base must be a float. You supplied a {type(base).__name__}.")
+    elif not math.isfinite(base) or base <= 0 or base == 1:
+        raise ValueError(f"base must be finite, > 0 and != 1, since it is a logarithm base. You supplied {base!r}.")
+
     # End checks
     ####################################################################################################
     # Validate measure
@@ -314,7 +359,24 @@ def ClonalDiversity(
 
     # Subset cells if requested
     if cells is not None:
+        # A single string is iterable, so list() would split it into characters.
+        if isinstance(cells, (str, bytes)):
+            raise TypeError(
+                f"cells must be an iterable of cell IDs, not a single string. For one cell use [{cells!r}]."
+            )
+        # end if statement
+
         cells = list(cells)
+
+        # obs.loc[cells] keeps repeated IDs, so they would be counted more than once.
+        requested_cell_index = pd.Index(cells)
+        if requested_cell_index.has_duplicates:
+            number_of_duplicated_cells = int(requested_cell_index.duplicated().sum())
+            raise ValueError(
+                f"cells contains {number_of_duplicated_cells} duplicate cell IDs, which would be counted more than once."
+            )
+        # end if statement
+
         missing = [c for c in cells if c not in obs.index]
         if missing:
             raise ValueError(f"Not all your cells are present in the object. Missing (first 5): {missing[:5]}")
@@ -361,6 +423,12 @@ def ClonalDiversity(
     # end if statement
 
     if diversity_measure == "EffectiveSpecies":
+        # Without any assigned cell there is no species. base**0 would report one,
+        # while the other measures return 0 here.
+        if counts.sum() <= 0:
+            return 0.0
+        # end if statement
+
         H = _shannon(counts, base=base)
         return float(base**H)
     # end if statement
@@ -469,8 +537,9 @@ def Spatial_Clone_Detection(
     Returns a 4-tuple. The last element is None if perform_ftu is False
     adata: AnnData
         The modified input object. The spots are reordered, which ensures consistent
-        results. Spots were reordered by ("array_row", "array_col").
-        The coordinates were also added to obs.
+        results. Spots were reordered by the second coordinate column of
+        adata.obsm[spatial_key], then by the first. adata.obs is not modified;
+        SpaGFT reads the coordinates directly from adata.obsm[spatial_key].
         Variants might have been filtered and the data might have been normalized.
         If low pass enhancement was performed, X is overwritten with the enhanced
         signal. The original values are saved in the layer X_original.
@@ -737,6 +806,8 @@ def Spatial_Clone_Detection(
     elif isinstance(ftu_resolution, Real):
         if not math.isfinite(ftu_resolution) or ftu_resolution <= 0:
             raise ValueError(f"ftu_resolution must be finite and > 0. You supplied {ftu_resolution!r}.")
+        # SpaGFT only accepts a Python float, int or list (np.float32 and np.int64 fail its assert).
+        ftu_resolution = float(ftu_resolution)
     elif isinstance(ftu_resolution, tuple):
         if len(ftu_resolution) != 3:
             raise ValueError(
@@ -756,6 +827,7 @@ def Spatial_Clone_Detection(
             raise ValueError(
                 f"ftu_resolution start ({start}) must be smaller than end ({end}), otherwise no resolution is tested."
             )
+        ftu_resolution = (float(start), float(end), float(step))
     elif isinstance(ftu_resolution, (list, np.ndarray)):
         values = list(ftu_resolution)
         if len(values) == 0:
@@ -765,6 +837,8 @@ def Spatial_Clone_Detection(
                 raise TypeError(f"Every ftu_resolution value must be a float. You supplied {type(value).__name__}.")
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Every ftu_resolution value must be finite value and > 0. You supplied {value!r}.")
+        # A plain list of Python floats is what SpaGFT and sc.tl.louvain expect.
+        ftu_resolution = [float(value) for value in values]
     else:
         raise TypeError(
             f"ftu_resolution must be a float, list, or tuple. You supplied {type(ftu_resolution).__name__}."
@@ -774,14 +848,14 @@ def Spatial_Clone_Detection(
     ####################################################################################################
     if verbose:
         print("We reorder the spots.", flush=True)
-    # Adding the spatial information to the obs information.
-    # First by array_row, then by array_col.
+    # First by the second coordinate column, then by the first.
     # numpy.lexsort treats the last key as the most important.
+    # SpaGFT reads the coordinates straight from adata.obsm[spatial_key], so we do not
+    # write them to obs. Writing them as array_row/array_col would overwrite Space Ranger's
+    # real array indices with the (pixel) values from obsm.
     coords_order = np.lexsort((coords[:, 0], coords[:, 1]))
     adata = adata[coords_order, :].copy()
     adata.obsm[spatial_key] = coords[coords_order].astype(np.float64, copy=True)
-    adata.obs["array_col"] = coords[coords_order, 0]
-    adata.obs["array_row"] = coords[coords_order, 1]
 
     if filter_by_min_spots:
         if verbose:
@@ -802,7 +876,15 @@ def Spatial_Clone_Detection(
     if verbose:
         print("Determine the number of low-frequency FMs and high-frequency FMs.", flush=True)
 
-    (ratio_low, ratio_high) = spg.gft.determine_frequency_ratio(adata, ratio_neighbors=ratio_use)
+    # determine_frequency_ratio caches its Fourier modes in adata.uns["FMs_after_select"], and
+    # detect_svg reuses them whenever the mode counts match, which they always do here.
+    # So the graph built here is the one detect_svg uses: it needs the same normalize_lap.
+    (ratio_low, ratio_high) = spg.gft.determine_frequency_ratio(
+        adata,
+        ratio_neighbors=ratio_use,
+        spatial_info=spatial_key,
+        normalize_lap=detect_svg_normalize_lap,
+    )
 
     if verbose:
         print("Detecting SVVs.", flush=True)
@@ -812,7 +894,7 @@ def Spatial_Clone_Detection(
         ratio_low_freq=ratio_low,
         ratio_high_freq=ratio_high,
         ratio_neighbors=ratio_use,
-        spatial_info=["array_row", "array_col"],  # hard-coded values since we define them above
+        spatial_info=spatial_key,  # SpaGFT accepts an obsm key directly
         filter_peaks=detect_svg_filter_peaks,
         S=detect_svg_S,
         cal_pval=detect_svg_cal_pval,
@@ -837,7 +919,7 @@ def Spatial_Clone_Detection(
             ratio_low_freq=low_pass_enhancement_ratio_low_freq,
             ratio_neighbors=ratio_use,
             c=low_pass_enhancement_c,
-            spatial_info=["array_row", "array_col"],  # hard-coded values since we define them above
+            spatial_info=spatial_key,  # SpaGFT accepts an obsm key directly
             normalize_lap=low_pass_enhancement_normalize_lap,
             inplace=True,
         )
@@ -863,10 +945,23 @@ def Spatial_Clone_Detection(
         )
         return adata, variant_df, svg_list, None
 
+    # This depends on the data, not only on the parameters, so it follows ftu_on_error
+    # like the empty svg_list above. Raising unconditionally would discard the finished
+    # SVV detection and enhancement for a user who asked for warnings.
     if neighbors_for_ftu >= len(svg_list):
-        raise ValueError(
-            f"neighbors_for_ftu ({neighbors_for_ftu}) must be less than the number of detected SVVs ({len(svg_list)})."
+        if ftu_on_error == "raise":
+            raise ValueError(
+                f"neighbors_for_ftu ({neighbors_for_ftu}) must be less than the number of detected SVVs ({len(svg_list)})."
+            )
+        warnings.warn(
+            f"neighbors_for_ftu ({neighbors_for_ftu}) is not less than the number of detected SVVs ({len(svg_list)}), so FTU identification was skipped. Reduce neighbors_for_ftu below {len(svg_list)}.",
+            FTUWarning,
+            stacklevel=2,
         )
+        return adata, variant_df, svg_list, None
+
+    # identify_ftu runs a PCA on the full object as a side effect (see _PCA_SIDE_EFFECT_KEYS).
+    pca_snapshot = _snapshot_slots(adata, _PCA_SIDE_EFFECT_KEYS)
 
     if perform_low_pass_enhancement:
         if verbose:
@@ -877,7 +972,7 @@ def Spatial_Clone_Detection(
                 svg_list=svg_list,
                 ratio_fms=ratio_low,
                 ratio_neighbors=ratio_use,
-                spatial_info=["array_row", "array_col"],  # hard-coded values since we define them above
+                spatial_info=spatial_key,  # SpaGFT accepts an obsm key directly
                 n_neighbors=neighbors_for_ftu,
                 resolution=ftu_resolution,
                 weight_by_freq=ftu_weight_by_freq,
@@ -901,6 +996,9 @@ def Spatial_Clone_Detection(
         else:
             _move_ftu_results(adata, "_enhanced")
 
+        finally:
+            _restore_slots(adata, _PCA_SIDE_EFFECT_KEYS, pca_snapshot)
+
         # Setting the original values back since we now need them for the second FTU selection.
         adata.layers["X_enhanced"] = adata.X.copy()
         adata.X = adata.layers["X_original"].copy()
@@ -914,7 +1012,7 @@ def Spatial_Clone_Detection(
             svg_list=svg_list,
             ratio_fms=ratio_low,
             ratio_neighbors=ratio_use,
-            spatial_info=["array_row", "array_col"],  # hard-coded values since we define them above
+            spatial_info=spatial_key,  # SpaGFT accepts an obsm key directly
             n_neighbors=neighbors_for_ftu,
             resolution=ftu_resolution,
             weight_by_freq=ftu_weight_by_freq,
@@ -934,8 +1032,300 @@ def Spatial_Clone_Detection(
 
         _drop_ftu_results(adata)  # clear partial results that might clutter the object
 
+    finally:
+        _restore_slots(adata, _PCA_SIDE_EFFECT_KEYS, pca_snapshot)
+
     # If we enhanced the data, we set the results back to X.
     if perform_low_pass_enhancement:
         adata.X = adata.layers["X_enhanced"].copy()
 
     return adata, variant_df, svg_list, variant_df_enhanced
+
+
+def _value_at_sorted_position(stored_values_sorted, negative_value_count, implicit_zero_count, sorted_position):
+    """
+    Value at a position of the virtually sorted column, without the implicit zeros.
+
+    The sorted column is: stored negative values, then all implicit zeros, then the
+    stored non-negative values (stored zeros sort among them, which is equivalent).
+    """
+    if sorted_position < negative_value_count:
+        return stored_values_sorted[sorted_position]
+    # end if statement
+
+    if sorted_position < negative_value_count + implicit_zero_count:
+        return 0.0
+    # end if statement
+
+    return stored_values_sorted[sorted_position - implicit_zero_count]
+
+
+def _sparse_column_quantiles_type7(sparse_matrix_csc, observed_value_counts, probabilities):
+    """
+    Per-column quantiles of a CSC matrix.
+    This is a port of R quantile(type = 7, na.rm = TRUE).
+
+    Parameters
+    ----------
+    sparse_matrix_csc : scipy.sparse.csc_matrix
+        Cells x variants. Stored entries must lie in observed cells only.
+    observed_value_counts : numpy.ndarray
+        Number of observed (non-NA in R) cells per column. Observed cells without a stored
+        entry are implicit zeros and enter the quantile as 0.
+    probabilities : sequence of float
+        Quantile probabilities in [0, 1].
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape (len(probabilities), number of columns). NaN for columns without observed cells,
+        as R returns NA for an all-NA vector.
+    """
+    number_of_columns = sparse_matrix_csc.shape[1]
+    quantile_values = np.full((len(probabilities), number_of_columns), np.nan, dtype=np.float64)
+    column_pointers = sparse_matrix_csc.indptr
+    all_stored_values = sparse_matrix_csc.data
+
+    for column_index in range(number_of_columns):
+        observed_value_count = int(observed_value_counts[column_index])
+        if observed_value_count == 0:
+            continue
+        # end if statement
+
+        stored_values_sorted = np.sort(
+            all_stored_values[column_pointers[column_index] : column_pointers[column_index + 1]]
+        )
+        implicit_zero_count = observed_value_count - stored_values_sorted.size
+        negative_value_count = int(np.searchsorted(stored_values_sorted, 0.0, side="left"))
+
+        for probability_index, probability in enumerate(probabilities):
+            # R, quantile.default, type 7 (written 0-based here):
+            # index = (n - 1) * p, lo = floor(index), hi = ceiling(index),
+            # Q = (1 - h) * x[lo] + h * x[hi] with h = index - lo.
+            quantile_index = (observed_value_count - 1) * probability
+            lower_position = math.floor(quantile_index)
+            upper_position = math.ceil(quantile_index)
+            lower_value = _value_at_sorted_position(
+                stored_values_sorted, negative_value_count, implicit_zero_count, lower_position
+            )
+            upper_value = _value_at_sorted_position(
+                stored_values_sorted, negative_value_count, implicit_zero_count, upper_position
+            )
+            interpolation_weight = quantile_index - lower_position
+            if interpolation_weight > 0 and upper_value != lower_value:
+                quantile_values[probability_index, column_index] = (
+                    1 - interpolation_weight
+                ) * lower_value + interpolation_weight * upper_value
+            else:
+                quantile_values[probability_index, column_index] = lower_value
+            # end if statement
+        # end for loop
+    # end for loop
+
+    return quantile_values
+
+
+def Variant_Selection_Quantile(
+    adata,
+    *,
+    min_coverage: int | float = 2,
+    quantiles: Sequence[float] = (0.1, 0.9),
+    thresholds: Sequence[float] = (0.1, 0.9),
+    min_quality: int | float | None = None,
+    mean_allele_frequency: int | float = 0,
+    remove_nocall: bool = False,
+    quality_column: str = "quality",
+    verbose: bool = True,
+) -> list[str]:
+    """
+    We get variants of interest using quantile thresholding.
+    Adapted from Peter van Galen, https://github.com/petervangalen/MAESTER-2021.
+    A variant is kept when its mean allele frequency is above `mean_allele_frequency`,
+    its mean coverage is above `min_coverage`, the lower quantile of its allele
+    frequencies is at most `thresholds[0]` and the upper quantile is at least
+    `thresholds[1]`.
+
+    The computation is sparse-native: quantiles are taken from the
+    stored entries of each variant plus a count of implicit zeros,
+    so no layer is densified.
+    The input object is not modified.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Cells x variants. Requires the layers fraction and coverage, plus the layer
+        consensus when remove_nocall is True.
+    min_coverage : int or float
+        Minimum mean coverage per variant (strictly greater than).
+    quantiles : sequence of two floats
+        The lower and upper quantile probabilities, each in [0, 1]. Computed like R's
+        quantile(type = 7).
+    thresholds : sequence of two floats
+        Allele frequency thresholds: lower quantile <= thresholds[0] and
+        upper quantile >= thresholds[1].
+    min_quality : int, float or None
+        Minimum variant quality (strictly greater than), read from adata.var[quality_column].
+        Variants with missing quality are removed. None disables the quality filter.
+    mean_allele_frequency : int or float
+        Minimum mean allele frequency (strictly greater than).
+    remove_nocall : bool
+        Should NoCall cells (consensus == 0) be disregarded? They are then excluded from the
+        means and quantiles, like NA with na.rm = TRUE in R.
+    quality_column : str
+        Column in adata.var with the variant quality. The loaders write "quality";
+        the R function uses rowData(SE)$VariantQuality.
+    verbose : bool
+        Should the function give updates?
+
+    Returns
+    -------
+    list of str
+        Names of the variants of interest, in the order of adata.var_names.
+    """
+    if not isinstance(verbose, (bool, np.bool_)):
+        raise TypeError(f"verbose must be bool. You supplied a {type(verbose).__name__}.")
+
+    if not isinstance(remove_nocall, (bool, np.bool_)):
+        raise TypeError(f"remove_nocall must be bool. You supplied a {type(remove_nocall).__name__}.")
+
+    if isinstance(min_coverage, (bool, np.bool_)) or not isinstance(min_coverage, Real):
+        raise TypeError(f"min_coverage must be an integer or a float. You supplied a {type(min_coverage).__name__}.")
+    elif not math.isfinite(min_coverage):
+        raise ValueError(f"min_coverage must be finite. You supplied {min_coverage!r}.")
+
+    if isinstance(mean_allele_frequency, (bool, np.bool_)) or not isinstance(mean_allele_frequency, Real):
+        raise TypeError(
+            f"mean_allele_frequency must be an integer or a float. You supplied a {type(mean_allele_frequency).__name__}."
+        )
+    elif not math.isfinite(mean_allele_frequency):
+        raise ValueError(f"mean_allele_frequency must be finite. You supplied {mean_allele_frequency!r}.")
+
+    if min_quality is not None:
+        if isinstance(min_quality, (bool, np.bool_)) or not isinstance(min_quality, Real):
+            raise TypeError(
+                f"min_quality must be an integer, a float or None. You supplied a {type(min_quality).__name__}."
+            )
+        elif not math.isfinite(min_quality):
+            raise ValueError(f"min_quality must be finite. You supplied {min_quality!r}.")
+        # end if statement
+    # end if statement
+
+    for parameter_name, parameter_value in (("quantiles", quantiles), ("thresholds", thresholds)):
+        if isinstance(parameter_value, (str, bytes)) or not isinstance(parameter_value, (Sequence, np.ndarray)):
+            raise TypeError(
+                f"{parameter_name} must be a sequence of two floats. You supplied a {type(parameter_value).__name__}."
+            )
+        elif len(parameter_value) != 2:
+            raise ValueError(f"{parameter_name} must contain exactly two values. You supplied {len(parameter_value)}.")
+        # end if statement
+
+        for single_value in parameter_value:
+            if isinstance(single_value, (bool, np.bool_)) or not isinstance(single_value, Real):
+                raise TypeError(
+                    f"Every value in {parameter_name} must be a float. You supplied a {type(single_value).__name__}."
+                )
+            elif not math.isfinite(single_value):
+                raise ValueError(f"Every value in {parameter_name} must be finite. You supplied {single_value!r}.")
+            # end if statement
+        # end for loop
+    # end for loop
+
+    for probability in quantiles:
+        if probability < 0 or probability > 1:
+            raise ValueError(f"quantiles must lie in [0, 1]. You supplied {probability!r}.")
+        # end if statement
+    # end for loop
+
+    if not isinstance(quality_column, str):
+        raise TypeError(f"quality_column must be a string. You supplied a {type(quality_column).__name__}.")
+
+    required_layers = ["fraction", "coverage"] + (["consensus"] if remove_nocall else [])
+    missing_layers = [layer_name for layer_name in required_layers if layer_name not in adata.layers]
+    if missing_layers:
+        raise KeyError(f"adata.layers misses {missing_layers}. Available layers are: {list(adata.layers.keys())}.")
+
+    if min_quality is not None and quality_column not in adata.var.columns:
+        raise KeyError(
+            f"min_quality is set, but adata.var has no column {quality_column!r}. "
+            f"Available columns are: {list(adata.var.columns)}."
+        )
+
+    # End of checks
+    ####################################################################################################
+    # Float64 copies, so sums over ~100k cells do not accumulate in float32 and adata stays untouched.
+    fraction_matrix = sp.csc_matrix(adata.layers["fraction"], dtype=np.float64, copy=True)
+    coverage_matrix = sp.csc_matrix(adata.layers["coverage"], dtype=np.float64, copy=True)
+
+    if np.isnan(fraction_matrix.data).any() or np.isnan(coverage_matrix.data).any():
+        raise ValueError(
+            "The fraction or coverage layer contains NaN. Missing values must be encoded via the "
+            "consensus layer (remove_nocall = True), not as NaN in the layers."
+        )
+
+    if remove_nocall:
+        if verbose:
+            print("We set NoCall cells as NA.", flush=True)
+        # end if statement
+
+        # True where a consensus call exists (consensus == 0 means NoCall). Sparse, unlike == 0.
+        called_mask = sp.csc_matrix(adata.layers["consensus"]) != 0
+        fraction_matrix = sp.csc_matrix(fraction_matrix.multiply(called_mask))
+        coverage_matrix = sp.csc_matrix(coverage_matrix.multiply(called_mask))
+        # R: rowMeans/quantile with na.rm = TRUE divide by the non-NA cells, which are the
+        # called cells, including reference calls whose allele frequency is exactly 0.
+        observed_cells_per_variant = np.asarray(called_mask.sum(axis=0)).ravel().astype(np.int64)
+    else:
+        observed_cells_per_variant = np.full(adata.n_vars, adata.n_obs, dtype=np.int64)
+    # end if statement
+
+    fraction_matrix.sum_duplicates()
+
+    if verbose:
+        print("Get the mean allele frequency and coverage.", flush=True)
+    # end if statement
+
+    # axis = 0 reduces over cells, giving one value per variant (R: rowMeans over SE rows).
+    fraction_sum_per_variant = np.asarray(fraction_matrix.sum(axis=0)).ravel()
+    coverage_sum_per_variant = np.asarray(coverage_matrix.sum(axis=0)).ravel()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_af = fraction_sum_per_variant / observed_cells_per_variant
+        mean_coverage = coverage_sum_per_variant / observed_cells_per_variant
+    # end with statement
+
+    if verbose:
+        print("Get the quantiles of the VAFs of each variant.", flush=True)
+    # end if statement
+
+    quantile_values = _sparse_column_quantiles_type7(
+        fraction_matrix, observed_cells_per_variant, [float(probability) for probability in quantiles]
+    )
+
+    variant_statistics = pd.DataFrame(
+        {
+            "Mean_AF": mean_af,
+            "Mean_Cov": mean_coverage,
+            "Quantile1": quantile_values[0],
+            "Quantile2": quantile_values[1],
+        },
+        index=adata.var_names,
+    )
+
+    keep_variant = np.ones(adata.n_vars, dtype=bool)
+    if min_quality is not None:
+        variant_quality = pd.to_numeric(adata.var[quality_column], errors="coerce").to_numpy(dtype=np.float64)
+        keep_variant &= ~np.isnan(variant_quality) & (variant_quality > min_quality)
+    # end if statement
+
+    if verbose:
+        print("Thresholding using the quantile approach.", flush=True)
+    # end if statement
+
+    # Comparisons with NaN are False, so variants without observed cells drop out, as in R's subset().
+    keep_variant &= (
+        (variant_statistics["Mean_AF"].to_numpy() > mean_allele_frequency)
+        & (variant_statistics["Mean_Cov"].to_numpy() > min_coverage)
+        & (variant_statistics["Quantile1"].to_numpy() <= thresholds[0])
+        & (variant_statistics["Quantile2"].to_numpy() >= thresholds[1])
+    )
+
+    return variant_statistics.index[keep_variant].tolist()
